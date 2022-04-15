@@ -1,6 +1,5 @@
 using System.Threading;
 using System.Threading.Tasks;
-using Coflnet.Sky.Base.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,6 +8,8 @@ using Microsoft.Extensions.Configuration;
 using System.Linq;
 using Microsoft.Extensions.Logging;
 using Coflnet.Sky.Base.Controllers;
+using Coflnet.Sky.Core;
+using System.Collections.Generic;
 
 namespace Coflnet.Sky.Base.Services
 {
@@ -35,31 +36,64 @@ namespace Coflnet.Sky.Base.Services
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             using var scope = scopeFactory.CreateScope();
-            var context = scope.ServiceProvider.GetRequiredService<BaseDbContext>();
-            // make sure all migrations are applied
-            await context.Database.MigrateAsync();
-
-            var flipCons = Coflnet.Kafka.KafkaConsumer.ConsumeBatch<LowPricedAuction>(config["KAFKA_HOST"], config["TOPICS:LOW_PRICED"], async batch =>
+            List<GoogleUser> users;
+            using (var oldContext = new HypixelContext())
             {
-                var service = GetService();
-                foreach (var lp in batch)
-                {
-                    await service.AddFlip(new Flip()
-                    {
-                        AuctionId = lp.UId,
-                        FinderType = lp.Finder,
-                        TargetPrice = lp.TargetPrice,
-                    });
-                }
-                consumeCount.Inc(batch.Count());
-            }, stoppingToken, "skybase");
-
-            await Task.WhenAll(flipCons);
+                users = await oldContext.Users.Where(u => u.PremiumExpires > System.DateTime.Now || u.ReferedBy != 0).ToListAsync();
+            }
+            await MigrateRefs(scope, users);
+            await MigratePayments(scope, users);
         }
 
-        private BaseService GetService()
+        private async Task MigratePayments(IServiceScope scope, List<GoogleUser> users)
         {
-            return scopeFactory.CreateScope().ServiceProvider.GetRequiredService<BaseService>();
+            using (var paymentDb = scope.ServiceProvider.GetRequiredService<Payments.Models.PaymentContext>())
+            {
+                if (paymentDb.Users.Any())
+                {
+                    logger.LogInformation("skipping payments as there are already users in db");
+                    return;
+                }
+                var premiumId = await paymentDb.Products.Where(p => p.Slug == "premium").FirstAsync();
+                foreach (var user in users.Where(u => u.PremiumExpires > System.DateTime.Now))
+                {
+                    var pUser = new Payments.Models.User()
+                    {
+                        ExternalId = user.Id.ToString()
+                    };
+                    pUser.Owns = new List<Payments.Models.OwnerShip>();
+                    pUser.Owns.Add(new Payments.Models.OwnerShip()
+                    {
+                        Expires = user.PremiumExpires,
+                        Product = premiumId,
+                        User = pUser
+                    });
+                    paymentDb.Users.Add(pUser);
+                }
+                await paymentDb.SaveChangesAsync();
+            }
+        }
+
+        private async Task MigrateRefs(IServiceScope scope, List<GoogleUser> users)
+        {
+            using (var refDb = scope.ServiceProvider.GetRequiredService<Sky.Referral.Models.ReferralDbContext>())
+            {
+                if (refDb.Referrals.Any())
+                {
+                    logger.LogInformation("skipping referrals as there are already some in db");
+                    return;
+                }
+                foreach (var user in users.Where(u => u.ReferedBy > 0))
+                {
+                    refDb.Referrals.Add(new Referral.Models.ReferralElement()
+                    {
+                        Invited = user.Id.ToString(),
+                        Inviter = user.ReferedBy.ToString(),
+                        Flags = Referral.Models.ReferralFlags.NONE
+                    });
+                }
+                await refDb.SaveChangesAsync();
+            }
         }
     }
 }
